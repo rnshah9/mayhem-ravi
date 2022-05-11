@@ -1,0 +1,6 @@
+project: rnshah9/mayhem-ravi
+target: ravi
+
+cmds:
+  - cmd: /ravi/build/ravi @@
+    filepath: test.lua
