@@ -99,7 +99,9 @@ enum {
 	MAXBIT = N_WORDS * ESIZE			      /* total bits */
 };
 
-//static_assert(N_WORDS == 4, "Invalid computation of bitset size"); /* must be kept in sync with PseudoGeneraotor.bits */
+#if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
+static_assert(N_WORDS == 4, "Invalid computation of bitset size"); /* must be kept in sync with PseudoGeneraotor.bits */
+#endif
 
 /* Identify the top most register allocated; this is useful when we need
  * to ensure that the next register goes to the top of the stack
@@ -181,6 +183,54 @@ static unsigned pseudo_gen_alloc(PseudoGenerator *generator, bool top)
 		generator->max_reg += 1;
 	return reg;
 }
+
+static void pseudo_gen_check(PseudoGenerator *generator, AstNode *node, const char *desc) {
+	unsigned reg = 0;
+	for (int i = 0; i < N_WORDS; i++) {
+		uint64_t bit = generator->bits[i];
+		if (bit == 0ull) {
+			/* no bits set? skip */
+			reg += ESIZE;
+			continue;
+		}
+		for (int j = 0; j < ESIZE; j++) {
+			int is_set = (bit & (1ull << j)) != 0;
+			if (is_set)
+				fprintf(stderr, "%s: REG %u is in use, line #%d\n", desc, reg, node->line_number);
+			reg++;
+		}
+	}
+}
+
+static void check_pseudo_is_top(Proc *proc, Pseudo *pseudo) {
+	PseudoGenerator *gen;
+	assert(!pseudo->freed);
+	switch (pseudo->type) {
+	case PSEUDO_TEMP_FLT:
+		gen = &proc->temp_flt_pseudos;
+		break;
+	case PSEUDO_TEMP_INT:
+	case PSEUDO_TEMP_BOOL:
+		gen = &proc->temp_int_pseudos;
+		break;
+	case PSEUDO_RANGE:
+	case PSEUDO_TEMP_ANY:
+		gen = &proc->temp_pseudos;
+		break;
+	default:
+		// Not a temp, so no need to do anything
+		return;
+	}
+	if (pseudo->temp_for_local)
+		return;
+	int top = top_reg(gen);
+	if (top < 0)
+		return;
+	if (top != pseudo->regnum) {
+		fprintf(stderr, "Top expected %u, found %u\n", top, pseudo->regnum);
+	}
+}
+
 
 /**
  * Allocates a register by reusing a free'd register if possible otherwise
@@ -333,12 +383,15 @@ static const Constant *allocate_string_constant(Proc *proc, const StringObject *
 	return add_constant(proc, &c);
 }
 
-static inline void add_instruction_operand(Proc *proc, Instruction *insn, Pseudo *pseudo)
+static inline Pseudo *add_instruction_operand(Proc *proc, Instruction *insn, Pseudo *pseudo)
 {
+	Pseudo *to_free = NULL;
 	if (pseudo->type == PSEUDO_INDEXED) {
 		pseudo = indexed_load(proc, pseudo);
+		to_free = pseudo;
 	}
 	raviX_ptrlist_add((PtrList **)&insn->operands, pseudo, proc->linearizer->compiler_state->allocator);
+	return to_free;
 }
 
 static inline void replace_instruction_operand(Proc *proc, Instruction *insn, Pseudo *old_pseudo, Pseudo *new_pseudo)
@@ -364,8 +417,14 @@ static Instruction *allocate_instruction(Proc *proc, enum opcode op, unsigned li
 static void free_instruction_operand_pseudos(Proc *proc, Instruction *insn)
 {
 	Pseudo *operand;
-	FOR_EACH_PTR_REVERSE(insn->operands, Pseudo, operand) { free_temp_pseudo(proc, operand, false); }
-	END_FOR_EACH_PTR_REVERSE(operand)
+	Pseudo *last = NULL;
+	FOR_EACH_PTR_REVERSE(insn->operands, Pseudo, operand) {
+		free_temp_pseudo(proc, operand, false);
+		last = operand;
+	} END_FOR_EACH_PTR_REVERSE(operand)
+	if (last != NULL && last->type == PSEUDO_RANGE_SELECT) {
+		free_temp_pseudo(proc, last->range_pseudo, false);
+	}
 }
 
 /* adds instruction to the current basic block */
@@ -619,14 +678,18 @@ static void instruct_totype(Proc *proc, Pseudo *target, const VariableType *vtyp
 		return;
 	}
 	Instruction *insn = allocate_instruction(proc, targetop, line_number);
+	Pseudo *tofree = NULL;
 	if (targetop == op_totype) {
 		assert(vtype->type_name);
 		const Constant *tname_constant = allocate_string_constant(proc, vtype->type_name);
 		Pseudo *tname_pseudo = allocate_constant_pseudo(proc, tname_constant);
-		add_instruction_operand(proc, insn, tname_pseudo);
+		tofree = add_instruction_operand(proc, insn, tname_pseudo);
 	}
 	add_instruction_target(proc, insn, target);
 	add_instruction(proc, insn);
+	assert(!tofree);
+	if (tofree)
+		free_temp_pseudo(proc, tofree, false);
 }
 
 static void linearize_function_args(LinearizerState *linearizer)
@@ -680,8 +743,28 @@ static Pseudo *linearize_literal(Proc *proc, AstNode *expr)
 static Pseudo *linearize_unary_operator(Proc *proc, AstNode *node)
 {
 	UnaryOperatorType op = node->unary_expr.unary_op;
-	Pseudo *subexpr = linearize_expression(proc, node->unary_expr.expr);
 	ravitype_t subexpr_type = node->unary_expr.expr->common_expr.type.type_code;
+
+	Pseudo *reserved = NULL;
+	if (op == UNOPR_NOT || op == UNOPR_BNOT || op == UNOPR_MINUS || op == UNOPR_LEN ||
+	    op == UNOPR_TO_INTEGER && subexpr_type != RAVI_TNUMINT ||
+	    op == UNOPR_TO_NUMBER && subexpr_type != RAVI_TNUMFLT) {
+		if (op == UNOPR_NOT || op == UNOPR_BNOT) {
+			reserved = allocate_temp_pseudo(proc, RAVI_TANY, true);
+		}
+		else if (op == UNOPR_MINUS) {
+			reserved = allocate_temp_pseudo(proc, subexpr_type, true);
+		}
+		else if (op == UNOPR_LEN) {
+			reserved = allocate_temp_pseudo(proc, node->unary_expr.type.type_code, true);
+		}
+		else {
+			reserved = allocate_temp_pseudo(proc, op == UNOPR_TO_INTEGER ? RAVI_TNUMINT : RAVI_TNUMFLT, true);
+		}
+	}
+
+	Pseudo *subexpr = linearize_expression(proc, node->unary_expr.expr);
+
 	enum opcode targetop = op_nop;
 	switch (op) {
 	case UNOPR_MINUS:
@@ -741,18 +824,20 @@ static Pseudo *linearize_unary_operator(Proc *proc, AstNode *node)
 	}
 	Instruction *insn = allocate_instruction(proc, targetop, node->line_number);
 	Pseudo *target = subexpr;
+	Pseudo *tofree1 = NULL;
 	if (op == UNOPR_TO_TYPE) {
 		const Constant *tname_constant = allocate_string_constant(proc, node->unary_expr.type.type_name);
 		Pseudo *tname_pseudo = allocate_constant_pseudo(proc, tname_constant);
-		add_instruction_operand(proc, insn, tname_pseudo);
+		tofree1 = add_instruction_operand(proc, insn, tname_pseudo);
+		assert(!tofree1);
 	} else if (op == UNOPR_NOT || op == UNOPR_BNOT) {
-		add_instruction_operand(proc, insn, target);
+		tofree1 = add_instruction_operand(proc, insn, target);
 		free_temp_pseudo(proc, target, false); //CHECK
-		target = allocate_temp_pseudo(proc, RAVI_TANY, false);
+		target = reserved;
 	} else if (op == UNOPR_MINUS || op == UNOPR_LEN) {
-		add_instruction_operand(proc, insn, target);
+		tofree1 = add_instruction_operand(proc, insn, target);
 		free_temp_pseudo(proc, target, false); //CHECK
-		target = allocate_temp_pseudo(proc, subexpr_type, false);
+		target = reserved;
 	}
 	/* unary ops set their operand in the target so we need to check here that the
 	 * operand is not in pending state.
@@ -762,14 +847,19 @@ static Pseudo *linearize_unary_operator(Proc *proc, AstNode *node)
 	}
 	add_instruction_target(proc, insn, target);
 	add_instruction(proc, insn);
+	if (tofree1)
+		free_temp_pseudo(proc, tofree1, false);
 
 	if (targetop == op_toint || targetop == op_toflt) {
+		Pseudo *tofree2 = NULL;
 		insn = allocate_instruction(proc, op_mov, node->line_number);
-		add_instruction_operand(proc, insn, target);
+		tofree2 = add_instruction_operand(proc, insn, target);
 		free_temp_pseudo(proc, target, false); //CHECK
-		target = allocate_temp_pseudo(proc, targetop == op_toint ? RAVI_TNUMINT: RAVI_TNUMFLT, false);
+		target = reserved;
 		add_instruction_target(proc, insn, target);
 		add_instruction(proc, insn);
+		if (tofree2)
+			free_temp_pseudo(proc, tofree2, false);
 	}
 	return target;
 }
@@ -777,9 +867,11 @@ static Pseudo *linearize_unary_operator(Proc *proc, AstNode *node)
 static Pseudo *instruct_move(Proc *proc, enum opcode op, Pseudo *target, Pseudo *src, unsigned line_number)
 {
 	Instruction *mov = allocate_instruction(proc, op, line_number);
-	add_instruction_operand(proc, mov, src);
+	Pseudo *tofree = add_instruction_operand(proc, mov, src);
 	add_instruction_target(proc, mov, target);
 	add_instruction(proc, mov);
+	if (tofree)
+		free_temp_pseudo(proc, tofree, false);
 	return target;
 }
 
@@ -789,10 +881,12 @@ static void instruct_cbr(Proc *proc, Pseudo *condition_pseudo, BasicBlock *true_
 	Pseudo *true_pseudo = allocate_block_pseudo(proc, true_block);
 	Pseudo *false_pseudo = allocate_block_pseudo(proc, false_block);
 	Instruction *insn = allocate_instruction(proc, op_cbr, line_number);
-	add_instruction_operand(proc, insn, condition_pseudo);
+	Pseudo *tofree = add_instruction_operand(proc, insn, condition_pseudo);
 	add_instruction_target(proc, insn, true_pseudo);
 	add_instruction_target(proc, insn, false_pseudo);
 	add_instruction(proc, insn);
+	if (tofree)
+		free_temp_pseudo(proc, tofree, false);
 }
 
 static void instruct_br(Proc *proc, Pseudo *pseudo, unsigned line_number)
@@ -845,7 +939,8 @@ static Pseudo *linearize_bool(Proc *proc, AstNode *node, bool is_and)
 	BasicBlock *first_block = create_block(proc);
 	BasicBlock *end_block = create_block(proc);
 
-	Pseudo *result = allocate_temp_pseudo(proc, RAVI_TANY, false);
+	// leave the result register on top of virtual stack
+	Pseudo *result = allocate_temp_pseudo(proc, RAVI_TANY, true);
 	Pseudo *operand1 = linearize_expression(proc, e1);
 	instruct_move(proc, op_mov, result, operand1, node->line_number);
 	free_temp_pseudo(proc, operand1, false);
@@ -861,7 +956,6 @@ static Pseudo *linearize_bool(Proc *proc, AstNode *node, bool is_and)
 	instruct_br(proc, allocate_block_pseudo(proc, end_block), node->line_number);
 
 	start_block(proc, end_block, node->line_number);
-
 	return result;
 }
 
@@ -870,10 +964,14 @@ static void create_binary_instruction(Proc *proc, enum opcode targetop, Pseudo *
 				      Pseudo *operand2, Pseudo *target, unsigned line_number)
 {
 	Instruction *insn = allocate_instruction(proc, targetop, line_number);
-	add_instruction_operand(proc, insn, operand1);
-	add_instruction_operand(proc, insn, operand2);
+	Pseudo *tofree1 = add_instruction_operand(proc, insn, operand1);
+	Pseudo *tofree2 = add_instruction_operand(proc, insn, operand2);
 	add_instruction_target(proc, insn, target);
 	add_instruction(proc, insn);
+	if (tofree1)
+		free_temp_pseudo(proc, tofree1, false);
+	if (tofree2)
+		free_temp_pseudo(proc, tofree2, false);
 }
 
 static Pseudo *linearize_binary_operator(Proc *proc, AstNode *node)
@@ -885,6 +983,11 @@ static Pseudo *linearize_binary_operator(Proc *proc, AstNode *node)
 	} else if (op == BINOPR_OR) {
 		return linearize_bool(proc, node, false);
 	}
+
+	// TODO check the type is correct for BINOPR_NE
+	ravitype_t target_type = node->binary_expr.type.type_code;
+	Pseudo *not_target = op == BINOPR_NE ? allocate_temp_pseudo(proc, target_type, true) : NULL;
+	Pseudo *target = allocate_temp_pseudo(proc, target_type, true);
 
 	AstNode *e1 = node->binary_expr.expr_left;
 	AstNode *e2 = node->binary_expr.expr_right;
@@ -1024,19 +1127,18 @@ static Pseudo *linearize_binary_operator(Proc *proc, AstNode *node)
 		break;
 	}
 
-	ravitype_t target_type = node->binary_expr.type.type_code;
 	free_temp_pseudo(proc, operand1, false);//CHECK
 	free_temp_pseudo(proc, operand2, false);//CHECK
-	Pseudo *target = allocate_temp_pseudo(proc, target_type, false);
 	create_binary_instruction(proc, (enum opcode) targetop, operand1, operand2, target, node->line_number);
 	if (op == BINOPR_NE) {
-		Pseudo *temp = target;
 		Instruction *not_insn = allocate_instruction(proc, op_not, node->line_number);
-		add_instruction_operand(proc, not_insn, target);
-		free_temp_pseudo(proc, temp, false);//CHECK
-		target = allocate_temp_pseudo(proc, target_type, false);
+		Pseudo *tofree = add_instruction_operand(proc, not_insn, target);
+		free_temp_pseudo(proc, target, false);//CHECK
+		target = not_target;
 		add_instruction_target(proc, not_insn, target);
 		add_instruction(proc, not_insn);
+		if (tofree)
+			free_temp_pseudo(proc, tofree, false);
 	}
 	return target;
 }
@@ -1049,13 +1151,27 @@ static Pseudo *linearize_concat_expression(Proc *proc, AstNode *expr)
 	ravitype_t target_type = expr->string_concatenation_expr.type.type_code;
 	Pseudo *target = allocate_temp_pseudo(proc, target_type, true);
 	AstNode *n;
+	int N = raviX_ptrlist_size((const PtrList *) expr->string_concatenation_expr.expr_list);
+	Pseudo **tofreelist = (Pseudo **)alloca( N* sizeof(Pseudo *));
+	Pseudo **operands = (Pseudo **)alloca( N * sizeof(Pseudo *));
+	int i = 0;
 	FOR_EACH_PTR(expr->string_concatenation_expr.expr_list, AstNode, n) {
 		Pseudo *operand = linearize_expression(proc, n);
-		add_instruction_operand(proc, insn, operand);
+		Pseudo *tofree =  add_instruction_operand(proc, insn, operand);
+		tofreelist[i] = tofree;
+		operands[i] = operand;
+		i++;
 	}
 	END_FOR_EACH_PTR(n)
 	add_instruction_target(proc, insn, target);
 	add_instruction(proc, insn);
+	for (i=0; i < N; i++) {
+		Pseudo *op = operands[i];
+		free_temp_pseudo(proc, op, false);
+		Pseudo *tofree = tofreelist[i];
+		if (tofree)
+			free_temp_pseudo(proc, tofree, false);
+	}
 	return target;
 }
 
@@ -1068,13 +1184,14 @@ static Pseudo *linearize_function_expr(Proc *proc, AstNode *expr)
 	linearize_function(proc->linearizer);
 	set_current_proc(proc->linearizer, curproc); // restore the proc
 	ravitype_t target_type = expr->function_expr.type.type_code;
-	Pseudo *target = allocate_temp_pseudo(proc, target_type, false);
+	Pseudo *target = allocate_temp_pseudo(proc, target_type, true);
 	Pseudo *operand = allocate_closure_pseudo(newproc);
 	Instruction *insn = allocate_instruction(proc, op_closure, expr->line_number);
-	add_instruction_operand(proc, insn, operand);
+	Pseudo *tofree = add_instruction_operand(proc, insn, operand);
 	add_instruction_target(proc, insn, target);
 	add_instruction(proc, insn);
-
+	if (tofree)
+		free_temp_pseudo(proc, tofree, false);
 	return target;
 }
 
@@ -1137,45 +1254,6 @@ static Pseudo *linearize_symbol_expression(Proc *proc, AstNode *expr)
 	}
 }
 
-static Pseudo *instruct_indexed_load(Proc *proc, ravitype_t container_type,
-					    Pseudo *container_pseudo, ravitype_t key_type,
-					    Pseudo *key_pseudo, ravitype_t target_type, unsigned line_number)
-{
-	int op = op_get;
-	switch (container_type) {
-	case RAVI_TTABLE:
-		op = op_tget;
-		break;
-	case RAVI_TARRAYINT:
-		op = op_iaget;
-		break;
-	case RAVI_TARRAYFLT:
-		op = op_faget;
-		break;
-	default:
-		break;
-	}
-	/* Note we rely upon ordering of enums here */
-	switch (key_type) {
-	case RAVI_TNUMINT:
-		op++;
-		break;
-	case RAVI_TSTRING:
-		assert(container_type != RAVI_TARRAYINT && container_type != RAVI_TARRAYFLT);
-		op += 2;
-		break;
-	default:
-		break;
-	}
-	Pseudo *target_pseudo = allocate_temp_pseudo(proc, target_type, false);
-	Instruction *insn = allocate_instruction(proc, (enum opcode)op, line_number);
-	add_instruction_operand(proc, insn, container_pseudo);
-	add_instruction_operand(proc, insn, key_pseudo);
-	add_instruction_target(proc, insn, target_pseudo);
-	add_instruction(proc, insn);
-	return target_pseudo;
-}
-
 static Pseudo *indexed_load_from_global(Proc *proc, Pseudo *index_pseudo)
 {
 	Pseudo *container_pseudo = index_pseudo->index_info.container;
@@ -1184,16 +1262,20 @@ static Pseudo *indexed_load_from_global(Proc *proc, Pseudo *index_pseudo)
 	assert(container_pseudo->type != PSEUDO_INDEXED);
 	assert(key_pseudo->type != PSEUDO_INDEXED);
 
-	Pseudo *target = allocate_temp_pseudo(proc, RAVI_TANY, false);
+	Pseudo *target = allocate_temp_pseudo(proc, RAVI_TANY, true);
 	Instruction *insn = allocate_instruction(proc, op_loadglobal, index_pseudo->index_info.line_number);
 
-	add_instruction_operand(proc, insn, container_pseudo);
-	add_instruction_operand(proc, insn, key_pseudo);
+	Pseudo *tofree1 = add_instruction_operand(proc, insn, container_pseudo);
+	Pseudo *tofree2 = add_instruction_operand(proc, insn, key_pseudo);
 	add_instruction_target(proc, insn, target);
 	add_instruction(proc, insn);
 	free_temp_pseudo(proc, container_pseudo, false);
 	free_temp_pseudo(proc, key_pseudo, false);
 	index_pseudo->index_info.used = 1;
+	if (tofree1)
+		free_temp_pseudo(proc, tofree1, false);
+	if (tofree2)
+		free_temp_pseudo(proc, tofree2, false);
 	return target;
 }
 
@@ -1240,15 +1322,19 @@ static Pseudo *indexed_load(Proc *proc, Pseudo *index_pseudo)
 	default:
 		break;
 	}
-	Pseudo *target_pseudo = allocate_temp_pseudo(proc, target_type, false);
 	Instruction *insn = allocate_instruction(proc, (enum opcode)op, line_number);
-	add_instruction_operand(proc, insn, container_pseudo);
-	add_instruction_operand(proc, insn, key_pseudo);
-	add_instruction_target(proc, insn, target_pseudo);
-	add_instruction(proc, insn);
+	Pseudo *tofree1 = add_instruction_operand(proc, insn, container_pseudo);
+	Pseudo *tofree2 = add_instruction_operand(proc, insn, key_pseudo);
 	free_temp_pseudo(proc, container_pseudo, false);
 	free_temp_pseudo(proc, key_pseudo, false);
 	index_pseudo->index_info.used = 1;
+	if (tofree1)
+		free_temp_pseudo(proc, tofree1, false);
+	if (tofree2)
+		free_temp_pseudo(proc, tofree2, false);
+	Pseudo *target_pseudo = allocate_temp_pseudo(proc, target_type, true);
+	add_instruction_target(proc, insn, target_pseudo);
+	add_instruction(proc, insn);
 	return target_pseudo;
 }
 
@@ -1284,18 +1370,22 @@ static void instruct_indexed_store(Proc *proc, ravitype_t table_type, Pseudo *ta
 	Instruction *insn = allocate_instruction(proc, (enum opcode) op, line_number);
 	add_instruction_target(proc, insn, table);
 	add_instruction_target(proc, insn, index_pseudo);
-	add_instruction_operand(proc, insn, value_pseudo);
+	Pseudo *tofree = add_instruction_operand(proc, insn, value_pseudo);
 	add_instruction(proc, insn);
+	if (tofree)
+		free_temp_pseudo(proc, tofree, false);
 }
 
 static void indexed_store_to_global(Proc *proc, Pseudo *index_pseudo, Pseudo *value_pseudo,
 			  ravitype_t value_type)
 {
 	Instruction *insn = allocate_instruction(proc, op_storeglobal, index_pseudo->index_info.line_number);
-	add_instruction_operand(proc, insn, value_pseudo);
+	Pseudo *tofree = add_instruction_operand(proc, insn, value_pseudo);
 	add_instruction_target(proc, insn, index_pseudo->index_info.container);
 	add_instruction_target(proc, insn, index_pseudo->index_info.key);
 	add_instruction(proc, insn);
+	if (tofree)
+		free_temp_pseudo(proc, tofree, false);
 }
 
 static void indexed_store(Proc *proc, Pseudo *index_pseudo, Pseudo *value_pseudo,
@@ -1339,10 +1429,55 @@ static void indexed_store(Proc *proc, Pseudo *index_pseudo, Pseudo *value_pseudo
 	assert(key_pseudo->type != PSEUDO_INDEXED);
 
 	Instruction *insn = allocate_instruction(proc, op, line_number);
-	add_instruction_operand(proc, insn, value_pseudo);
+	Pseudo *tofree = add_instruction_operand(proc, insn, value_pseudo);
 	add_instruction_target(proc, insn, container_pseudo);
 	add_instruction_target(proc, insn, key_pseudo);
 	add_instruction(proc, insn);
+	if (tofree)
+		free_temp_pseudo(proc, tofree, false);
+}
+
+static Pseudo *instruct_indexed_load(Proc *proc, ravitype_t container_type,
+				     Pseudo *container_pseudo, ravitype_t key_type,
+				     Pseudo *key_pseudo, ravitype_t target_type, unsigned line_number)
+{
+	int op = op_get;
+	switch (container_type) {
+	case RAVI_TTABLE:
+		op = op_tget;
+		break;
+	case RAVI_TARRAYINT:
+		op = op_iaget;
+		break;
+	case RAVI_TARRAYFLT:
+		op = op_faget;
+		break;
+	default:
+		break;
+	}
+	/* Note we rely upon ordering of enums here */
+	switch (key_type) {
+	case RAVI_TNUMINT:
+		op++;
+		break;
+	case RAVI_TSTRING:
+		assert(container_type != RAVI_TARRAYINT && container_type != RAVI_TARRAYFLT);
+		op += 2;
+		break;
+	default:
+		break;
+	}
+	Instruction *insn = allocate_instruction(proc, (enum opcode)op, line_number);
+	Pseudo *tofree1 = add_instruction_operand(proc, insn, container_pseudo);
+	Pseudo *tofree2 = add_instruction_operand(proc, insn, key_pseudo);
+	if (tofree1)
+		free_temp_pseudo(proc, tofree1, false);
+	if (tofree2)
+		free_temp_pseudo(proc, tofree2, false);
+	Pseudo *target_pseudo = allocate_temp_pseudo(proc, target_type, true);
+	add_instruction_target(proc, insn, target_pseudo);
+	add_instruction(proc, insn);
+	return target_pseudo;
 }
 
 /**
@@ -1367,13 +1502,26 @@ static Pseudo *linearize_function_call_expression(Proc *proc, AstNode *expr,
 							callsite_pseudo, RAVI_TSTRING, name_pseudo, RAVI_TANY, expr->line_number);
 	}
 
-	add_instruction_operand(proc, insn, callsite_pseudo);
+	// Must move call site if necessary after all args etc are evaluated as
+	// the evaluations may use temp registers
+	// args are pushed to callsite stack by the codegen
+	// callsite needs to be at the top of the stack and also must be a temp
+	if (callsite_pseudo->type != PSEUDO_TEMP_ANY) {
+		Pseudo *temp = allocate_temp_pseudo(proc, RAVI_TANY, true);
+		instruct_move(proc, op_mov, temp, callsite_pseudo, expr->line_number);
+		callsite_pseudo = temp;
+	}
+
+	Pseudo *tofree1 = add_instruction_operand(proc, insn, callsite_pseudo);
+	Pseudo *tofree2 = NULL;
 	if (self_arg) {
-		add_instruction_operand(proc, insn, self_arg);
+		tofree2 = add_instruction_operand(proc, insn, self_arg);
 	}
 
 	AstNode *arg;
 	int argc = raviX_ptrlist_size((const PtrList *)expr->function_call_expr.arg_list);
+	Pseudo **tofreelist = (Pseudo **) alloca(argc * sizeof(Pseudo *));
+	int argi = 0;
 	FOR_EACH_PTR(expr->function_call_expr.arg_list, AstNode, arg)
 	{
 		argc -= 1;
@@ -1382,21 +1530,9 @@ static Pseudo *linearize_function_call_expression(Proc *proc, AstNode *expr,
 			// Not last one, so range can only be 1
 			convert_range_to_temp(arg_pseudo);
 		}
-		add_instruction_operand(proc, insn, arg_pseudo);
+		tofreelist[argi++] = add_instruction_operand(proc, insn, arg_pseudo);
 	}
 	END_FOR_EACH_PTR(arg)
-
-	// Must move call site if necessary after all args etc are evaluated as
-	// the evaluations may use temp registers
-	// args are pushed to callsite stack by the codegen
-	// callsite needs to be at the top of the stack and also must be a temp
-	if (callsite_pseudo->type != PSEUDO_TEMP_ANY ||
-	    callsite_pseudo->type == PSEUDO_TEMP_ANY && !pseudo_gen_is_top(&proc->temp_pseudos, callsite_pseudo->regnum)) {
-		Pseudo *temp = allocate_temp_pseudo(proc, RAVI_TANY, true);
-		instruct_move(proc, op_mov, temp, callsite_pseudo, expr->line_number);
-		replace_instruction_operand(proc, insn, callsite_pseudo, temp);
-		callsite_pseudo = temp;
-	}
 
 	Pseudo *return_pseudo = allocate_range_pseudo(
 	    proc, callsite_pseudo); /* Base reg for function call - where return values will be placed */
@@ -1405,7 +1541,15 @@ static Pseudo *linearize_function_call_expression(Proc *proc, AstNode *expr,
 	add_instruction(proc, insn);
 
 	free_instruction_operand_pseudos(proc, insn);
-
+	if (tofree1)
+		free_temp_pseudo(proc, tofree1, false);
+	if (tofree2)
+		free_temp_pseudo(proc, tofree2, false);
+	for (int i = 0; i < argi; i++) {
+		Pseudo *tofree = tofreelist[i];
+		if (tofree)
+			free_temp_pseudo(proc, tofree, false);
+	}
 	return return_pseudo;
 }
 
@@ -1468,6 +1612,11 @@ static int linearize_indexed_assign(Proc *proc, Pseudo *table, ravitype_t table_
 		index_type = RAVI_TNUMINT;
 	}
 	Pseudo *value_pseudo = linearize_expression(proc, expr->table_elem_assign_expr.value_expr);
+	if (value_pseudo->type == PSEUDO_RANGE) {
+		// FIXME we need to allow range in the last element
+		// But codegen can't handle that at the moment
+		convert_range_to_temp(value_pseudo);
+	}
 	ravitype_t value_type = expr->table_elem_assign_expr.value_expr->common_expr.type.type_code;
 	instruct_indexed_store(proc, table_type, table, index_pseudo, index_type, value_pseudo, value_type, expr->line_number);
 	free_temp_pseudo(proc, index_pseudo, false);
@@ -1478,7 +1627,7 @@ static int linearize_indexed_assign(Proc *proc, Pseudo *table, ravitype_t table_
 static Pseudo *linearize_table_constructor(Proc *proc, AstNode *expr)
 {
 	/* constructor -> '{' [ field { sep field } [sep] ] '}' where sep -> ',' | ';' */
-	Pseudo *target = allocate_temp_pseudo(proc, expr->table_expr.type.type_code, false);
+	Pseudo *target = allocate_temp_pseudo(proc, expr->table_expr.type.type_code, true);
 	enum opcode op = op_newtable;
 	if (expr->table_expr.type.type_code == RAVI_TARRAYINT)
 		op = op_newiarray;
@@ -1578,7 +1727,7 @@ static ravitype_t get_type(LuaSymbol *symbol) {
 
 static Pseudo *copy_to_temp_if_necessary(Proc *proc, Pseudo *original, unsigned line_number) {
 	if (original->type == PSEUDO_SYMBOL) {
-		Pseudo *copy = allocate_temp_pseudo(proc, get_type(original->symbol), false);
+		Pseudo *copy = allocate_temp_pseudo(proc, get_type(original->symbol), true);
 		instruct_move(proc, op_mov, copy, original, line_number);
 		// TODO we may need to set type more specifically
 		return copy;
@@ -1673,6 +1822,9 @@ static void linearize_assignment(Proc *proc, AstNodeList *expr_list, struct node
 	}
 	for (int i = nv-1; i >= 0; i--) {
 		free_temp_pseudo(proc, varinfo[i].pseudo, false);
+	}
+	if (last_val_pseudo != NULL && last_val_pseudo->type == PSEUDO_RANGE) {
+		free_temp_pseudo(proc, last_val_pseudo, false);
 	}
 	return;
 }
@@ -1769,14 +1921,18 @@ static Pseudo *linearize_builtin_expression(Proc *proc, AstNode *expr)
 		handle_error(proc->linearizer->compiler_state, "feature not yet implemented");
 	}
 	Instruction *insn = allocate_instruction(proc, op_C__new, expr->line_number);
+	Pseudo *target = allocate_temp_pseudo(proc, RAVI_TUSERDATA, true);
 	const StringObject *type_name = astlist_get(expr->builtin_expr.arg_list, 0)->literal_expr.u.ts;
-	add_instruction_operand(proc, insn, allocate_constant_pseudo(proc, allocate_string_constant(proc, type_name)));
+	Pseudo *tofree1 = add_instruction_operand(proc, insn, allocate_constant_pseudo(proc, allocate_string_constant(proc, type_name)));
 	Pseudo *size_expr = linearize_expression(proc, astlist_get(expr->builtin_expr.arg_list, 1));
-	add_instruction_operand(proc, insn, size_expr);
-	Pseudo *target = allocate_temp_pseudo(proc, RAVI_TUSERDATA, false);
+	Pseudo *tofree2 = add_instruction_operand(proc, insn, size_expr);
 	add_instruction_target(proc, insn, target);
 	add_instruction(proc, insn);
 	free_temp_pseudo(proc, size_expr, false);
+	if (tofree1)
+		free_temp_pseudo(proc, tofree1, false);
+	if (tofree2)
+		free_temp_pseudo(proc, tofree2, false);
 	return target;
 }
 
@@ -1824,6 +1980,7 @@ static Pseudo *linearize_expression(Proc *proc, AstNode *expr)
 		// Need to truncate the results to 1
 		return raviX_allocate_range_select_pseudo(proc, result, 0);
 	}
+	check_pseudo_is_top(proc, result);
 	return result;
 }
 
@@ -2692,6 +2849,9 @@ static void linearize_statement(Proc *proc, AstNode *node)
 		handle_error(proc->linearizer->compiler_state, "unknown statement type");
 		break;
 	}
+//	pseudo_gen_check(&proc->temp_pseudos, node, "temp_pseudos");
+//	pseudo_gen_check(&proc->temp_flt_pseudos, node, "temp_flt_pseudos");
+//	pseudo_gen_check(&proc->temp_int_pseudos, node, "temp_int_pseudos");
 }
 
 /**
