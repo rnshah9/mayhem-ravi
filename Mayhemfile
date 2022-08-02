@@ -2,5 +2,4 @@ project: ravi
 target: ravi
 
 cmds:
-  - cmd: /ravi/build/ravi test.lua
-    filepath: test.lua
+  - cmd: /install/bin/ravi @@
